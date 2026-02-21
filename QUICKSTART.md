@@ -6,14 +6,26 @@ cd c:\Users\PMLS\Desktop\sentimentAnalysis
 pip install -r requirements.txt
 ```
 
-## Step 2: Verify (1 minute)
+## Step 2: Place Trained Model (1 minute)
+Copy your `model_output` folder (from Google Drive) into the project root:
+
+```
+SentimentAnalysis/
+	model_output/
+		best.pt
+		tokenizer_config.json
+		vocab.txt
+		...
+```
+
+## Step 3: Verify (1 minute)
 ```bash
 python setup_check.py
 ```
 
 Expected: All ✅ checkmarks
 
-## Step 3: Run Demo (1 minute)
+## Step 4: Run Demo (1 minute)
 ```bash
 python example_workflow.py
 ```
@@ -34,21 +46,10 @@ python sentiment_analysis_api.py
 http://localhost:8000/docs
 ```
 
-### Submit 5 Comments:
-1. Use the `/submit` endpoint
-2. After 5th comment → **BATCH TRIGGERS**
-3. Score computed and cached
-
----
-
-## Configuration
-
-**Batch Size:** Set to 5 (in `sentiment_analysis_api.py` line 40)
-```python
-BATCH_THRESHOLD = 5  # For FYP demo
-```
-
-**Change for production:** Set to 20 for Glassdoor-style updates
+### Analyze Comments:
+1. Use the `/analyze` endpoint
+2. Provide a list of comments
+3. Get sentiment scores back for each comment
 
 ---
 
@@ -56,7 +57,6 @@ BATCH_THRESHOLD = 5  # For FYP demo
 
 ### Code Files (Don't delete):
 - `sentiment_analyzer.py` - DistilBERT sentiment
-- `aspect_extractor.py` - Extract 6 aspects
 - `anti_manipulation.py` - 5-layer fraud detection
 - `reputation_scorer.py` - Bayesian smoothing + CI
 - `sentiment_analysis_api.py` - **Main API server**
@@ -80,9 +80,6 @@ python sentiment_analysis_api.py
 
 # Test sentiment only
 python sentiment_analyzer.py
-
-# Test aspects only
-python aspect_extractor.py
 
 # Check setup
 python setup_check.py
@@ -118,16 +115,14 @@ netstat -ano | findstr :8000
 
 **Key Points:**
 1. Uses DistilBERT (AI) + Bayesian smoothing (Statistics)
-2. Batch processing after 5 comments (N=5 for demo)
-3. Shows confidence intervals (transparency)
-4. 5-layer fraud detection (rigor)
-5. Per-aspect breakdown (actionable)
+2. Multitask outputs overall + aspect scores
+3. 5-layer fraud detection (rigor)
+4. Per-aspect breakdown (actionable)
 
 **Demo Flow:**
 1. Start API: `python sentiment_analysis_api.py`
-2. Submit 5 comments via browser (http://localhost:8000/docs)
-3. Show batch trigger after 5th comment
-4. Display final score with confidence + aspects
+2. Submit comments via browser (http://localhost:8000/docs)
+3. Display sentiment scores + aspect outputs
 
 **Advantages over Glassdoor:**
 - ✅ Transparent (shows methodology)

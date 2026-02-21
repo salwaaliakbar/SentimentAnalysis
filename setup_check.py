@@ -113,31 +113,19 @@ def check_dependencies():
     return True
 
 def download_model():
-    """Pre-download transformer model."""
-    print_section("5. Downloading Sentiment Model")
-    
-    print("This may take a few minutes on first run...")
-    print("Downloading distilbert-base-uncased to cache...")
-    
-    try:
-        from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
-        
-        print("• Downloading tokenizer...")
-        DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
-        
-        print("• Downloading model...")
-        DistilBertForSequenceClassification.from_pretrained(
-            "distilbert-base-uncased",
-            num_labels=3
-        )
-        
-        print("✅ Model downloaded to Hugging Face cache")
+    """Check local trained model and tokenizer files."""
+    print_section("5. Checking Trained Model")
+
+    model_dir = Path("model_output")
+    weights_path = model_dir / "best.pt"
+
+    if weights_path.exists():
+        print(f"✅ Found trained weights: {weights_path}")
         return True
-    
-    except Exception as e:
-        print(f"❌ Error downloading model: {e}")
-        print("   You can download manually by running example_workflow.py")
-        return False
+
+    print("❌ Trained model not found in model_output/")
+    print("   Place the Google Drive model_output folder in the project root.")
+    return False
 
 def test_import():
     """Test importing core modules."""
@@ -145,7 +133,6 @@ def test_import():
     
     modules = [
         'sentiment_analyzer',
-        'aspect_extractor',
         'reputation_scorer',
         'anti_manipulation'
     ]
@@ -179,6 +166,7 @@ def run_quick_test():
         
         print(f"✅ Result:")
         print(f"   Label: {result['label']}")
+        print(f"   Overall Rating: {result['overall_rating']:.2f}/5.0")
         print(f"   Confidence: {result['confidence']:.3f}")
         print(f"   Sentiment Signal: {result['sentiment_signal']:+.3f}")
         

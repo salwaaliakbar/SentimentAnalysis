@@ -14,7 +14,6 @@ This script shows:
 from datetime import datetime, timedelta
 import numpy as np
 from sentiment_analyzer import SentimentAnalyzer
-from aspect_extractor import AspectExtractor
 from reputation_scorer import ReputationScorer
 from anti_manipulation import AntiManipulationEngine
 
@@ -43,10 +42,6 @@ def main():
     print("  Loading sentiment analyzer...")
     sentiment_analyzer = SentimentAnalyzer(device='cpu')
     print("  ✅ Sentiment analyzer ready")
-    
-    print("  Loading aspect extractor...")
-    aspect_extractor = AspectExtractor()
-    print("  ✅ Aspect extractor ready")
     
     print("  Loading reputation scorer...")
     reputation_scorer = ReputationScorer(
@@ -99,17 +94,17 @@ def main():
         sentiment = sentiment_analyzer.predict(comment)
         sentiment_results.append(sentiment)
         
-        # Aspect extraction
-        aspects = aspect_extractor.extract_full(
-            comment,
-            external_sentiment_signal=sentiment['sentiment_signal']
-        )
-        aspect_results.append(aspects['sentiments'])
+        aspect_results.append(sentiment.get("aspect_sentiments", {}))
         
         print(f"\n  [{i+1:2d}] \"{comment[:50]}...\"")
-        print(f"       Label: {sentiment['label']:8s} | Confidence: {sentiment['confidence']:.3f} | "
-              f"Signal S_c: {sentiment['sentiment_signal']:+.3f}")
-        print(f"       Aspects: {', '.join(list(aspects['sentiments'].keys())[:3]) if aspects['sentiments'] else 'general'}")
+        print(
+            f"       Label: {sentiment['label']:8s} | Confidence: {sentiment['confidence']:.3f} | "
+            f"Overall: {sentiment['overall_rating']:.2f}/5.0 | Signal S_c: {sentiment['sentiment_signal']:+.3f}"
+        )
+        print(
+            "       Aspects: "
+            f"{', '.join(list(sentiment.get('aspect_sentiments', {}).keys())[:3]) if sentiment.get('aspect_sentiments') else 'general'}"
+        )
     
     # ────────────────────────────────────────────────────────────────────────
     # Step 4: Anti-manipulation detection
@@ -206,18 +201,13 @@ def main():
     
     print_subheader("STEP 6: Aspect-Based Sentiment Analysis")
     
-    # Aggregate aspect scores
-    from aspect_extractor import aggregate_aspect_scores
-    
-    aspect_scores = aggregate_aspect_scores(
-        [{'sentiments': aspect_results[i]} for i in approved_submissions]
+    # Aggregate aspect scores (5-star scale)
+    aspect_scores_5star = reputation_scorer.compute_aspect_scores(
+        [aspect_results[i] for i in approved_submissions],
+        submission_timestamps=timestamps,
+        current_time=now,
+        scale='5star'
     )
-    
-    # Convert to 5-star scale
-    aspect_scores_5star = {
-        aspect: 3.0 + 2.0 * score
-        for aspect, score in aspect_scores.items()
-    }
     
     print(f"\n  Company Reputation by Aspect (5-star scale):")
     print(f"  {'Aspect':<20} {'Score':<15} {'Sentiment':<20} {'Assessment'}")
@@ -225,7 +215,7 @@ def main():
     
     for aspect in sorted(aspect_scores_5star.keys()):
         score = aspect_scores_5star[aspect]
-        signal = aspect_scores[aspect]
+        signal = (aspect_scores_5star[aspect] - 3.0) / 2.0
         
         if score >= 4.0:
             assessment = "💚 Strong"

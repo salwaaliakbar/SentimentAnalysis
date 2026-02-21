@@ -138,9 +138,6 @@ curl -X POST http://localhost:8000/submit ^
 # Test DistilBERT sentiment only
 python sentiment_analyzer.py
 
-# Test aspect extraction only
-python aspect_extractor.py
-
 # Test reputation scoring only
 python reputation_scorer.py
 
@@ -605,7 +602,6 @@ A: Handles 1000+ reviews/day on single GPU.
 | File | Purpose | When It Runs |
 |------|---------|--------------|
 | `sentiment_analyzer.py` | DistilBERT sentiment analysis | Every comment |
-| `aspect_extractor.py` | Extract 6 aspects from text | Every comment |
 | `anti_manipulation.py` | 5-layer fraud detection | Every comment |
 | `reputation_scorer.py` | Bayesian smoothing + CI + final score | After 5 comments (batch) |
 
