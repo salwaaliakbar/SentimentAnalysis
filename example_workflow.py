@@ -12,6 +12,7 @@ This script shows:
 """
 
 from datetime import datetime, timedelta
+import json
 import numpy as np
 from sentiment_analyzer import SentimentAnalyzer
 from reputation_scorer import ReputationScorer
@@ -88,13 +89,33 @@ def main():
     
     sentiment_results = []
     aspect_results = []
+    per_comment_details = []
     
     for i, comment in enumerate(sample_comments):
         # Sentiment prediction
         sentiment = sentiment_analyzer.predict(comment)
         sentiment_results.append(sentiment)
-        
-        aspect_results.append(sentiment.get("aspect_sentiments", {}))
+
+        aspect_scores = sentiment.get("aspect_scores", {})
+        aspect_signals = sentiment.get("aspect_sentiments", {})
+        aspect_results.append(aspect_signals)
+
+        per_comment_details.append(
+            {
+                "index": i + 1,
+                "text": comment,
+                "sentiment": {
+                    "label": sentiment["label"],
+                    "confidence": sentiment["confidence"],
+                    "overall_rating": sentiment["overall_rating"],
+                    "sentiment_signal": sentiment["sentiment_signal"],
+                },
+                "aspects": {
+                    "scores": aspect_scores,
+                    "signals": aspect_signals,
+                },
+            }
+        )
         
         print(f"\n  [{i+1:2d}] \"{comment[:50]}...\"")
         print(
@@ -123,6 +144,7 @@ def main():
             sentiment_confidence=sentiment_results[i]['confidence']
         )
         manipulation_checks.append(result)
+        per_comment_details[i]["anti_manipulation"] = result
         
         if result['flags']:
             print(f"  [{i+1:2d}] ⚠️  Flags: {', '.join(result['flags'])}")
@@ -132,6 +154,9 @@ def main():
     flagged_count = sum(1 for c in manipulation_checks if c['flags'])
     print(f"\n  Summary: {flagged_count} out of {len(sample_comments)} submissions flagged")
     print(f"  All-clear submissions: {len(sample_comments) - flagged_count}")
+
+    print_subheader("STEP 4B: Per-Comment Details (JSON)")
+    print(json.dumps(per_comment_details, indent=2))
     
     # ────────────────────────────────────────────────────────────────────────
     # Step 5: Compute reputation score
@@ -315,6 +340,44 @@ def main():
     
     if ci_width > 1.0:
         print("     - Collect more reviews to stabilize scores")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Step 9: Reputation summary
+    # ────────────────────────────────────────────────────────────────────────
+
+    print_subheader("STEP 9: Company Reputation Summary")
+
+    # Pros/cons based on aspect scores
+    pros = [a for a, s in aspect_scores_5star.items() if s >= 3.5]
+    cons = [a for a, s in aspect_scores_5star.items() if s < 2.5]
+
+    summary = {
+        "company": company_name,
+        "overall_rating_5star": round(score_5star["score"], 1),
+        "overall_rating_percent": round(score_100["score"], 0),
+        "confidence_interval_5star": {
+            "lower": round(score_5star["ci_lower"], 1),
+            "upper": round(score_5star["ci_upper"], 1)
+        },
+        "sample_size": score_5star["sample_size"],
+        "aspect_ratings_5star": {k: round(v, 1) for k, v in aspect_scores_5star.items()},
+        "pros": pros,
+        "cons": cons,
+        "recommendation": "Improve overall experience" if score_5star["score"] >= 3.0 else "Urgent action on weaknesses"
+    }
+
+    print(f"  Company: {summary['company']}")
+    print(f"  Overall Rating: {summary['overall_rating_5star']:.1f}/5.0 ({summary['overall_rating_percent']:.0f}%)")
+    print(
+        f"  Confidence Interval: [{summary['confidence_interval_5star']['lower']:.1f}, "
+        f"{summary['confidence_interval_5star']['upper']:.1f}]"
+    )
+    print("  Aspect Ratings:")
+    for aspect in sorted(summary["aspect_ratings_5star"].keys()):
+        print(f"    - {aspect}: {summary['aspect_ratings_5star'][aspect]:.1f}/5.0")
+    print(f"  Pros: {', '.join(summary['pros']) if summary['pros'] else 'None'}")
+    print(f"  Cons: {', '.join(summary['cons']) if summary['cons'] else 'None'}")
+    print(f"  Recommendation: {summary['recommendation']}")
     
     # ────────────────────────────────────────────────────────────────────────
     # Conclusion

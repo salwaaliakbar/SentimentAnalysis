@@ -289,30 +289,46 @@ class AntiManipulationEngine:
                 'is_suspicious': bool,
                 'flags': [list of detected issues],
                 'weight_factor': float (1.0 = normal, <1.0 = downweight),
-                'recommendation': 'approve' | 'review' | 'reject'
+                'recommendation': 'approve' | 'review' | 'reject',
+                'details': {rule-specific diagnostics}
             }
         """
         flags = []
         weight_factor = 1.0
+        extremity_score = None
+        duplicate_similarity = None
+        ip_count_today = None
+
+        low_conf_threshold = 0.60
+        extremity_threshold = 0.60
+        duplicate_threshold = 0.85
         
         # Flag 1: Low sentiment confidence
-        if sentiment_confidence < 0.60:
+        if sentiment_confidence < low_conf_threshold:
             flags.append('low_confidence')
         
         # Flag 2: Extremity bias
-        is_extreme, extremity_score = self.extremity_detector.is_suspicious(text)
+        is_extreme, extremity_score = self.extremity_detector.is_suspicious(
+            text,
+            threshold=extremity_threshold
+        )
         if is_extreme:
             flags.append('extremity_bias')
             weight_factor *= 0.5  # Half-weight
         
         # Flag 3: Duplicate detection
         if recent_submissions:
+            best_sim = 0.0
             for past_comment in recent_submissions:
                 sim = self.duplicate_detector.jaccard_similarity(text, past_comment)
-                if sim > 0.85:
+                if sim > best_sim:
+                    best_sim = sim
+                if sim > duplicate_threshold:
                     flags.append('duplicate')
                     weight_factor *= 0.3  # Heavily downweight
                     break
+            if best_sim > 0.0:
+                duplicate_similarity = best_sim
         
         # Flag 4: Temporal clustering (many submissions from same IP)
         if ip_hash:
@@ -346,7 +362,29 @@ class AntiManipulationEngine:
             'flags': flags,
             'weight_factor': float(weight_factor),
             'recommendation': recommendation,
-            'extremity_score': extremity_score if 'extremity_bias' in flags else None
+            'extremity_score': extremity_score if 'extremity_bias' in flags else None,
+            'details': {
+                'low_confidence': {
+                    'triggered': 'low_confidence' in flags,
+                    'confidence': float(sentiment_confidence),
+                    'threshold': float(low_conf_threshold)
+                },
+                'extremity_bias': {
+                    'triggered': 'extremity_bias' in flags,
+                    'score': float(extremity_score) if extremity_score is not None else None,
+                    'threshold': float(extremity_threshold)
+                },
+                'duplicate': {
+                    'triggered': 'duplicate' in flags,
+                    'max_similarity': float(duplicate_similarity) if duplicate_similarity is not None else None,
+                    'threshold': float(duplicate_threshold)
+                },
+                'temporal_clustering': {
+                    'triggered': 'temporal_clustering' in flags,
+                    'count_last_24h': int(ip_count_today) if ip_count_today is not None else None,
+                    'max_per_day': int(self.max_submissions_per_day)
+                }
+            }
         }
     
     def downweight_anomalies(
