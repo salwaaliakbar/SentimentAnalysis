@@ -9,11 +9,13 @@ Inference wrapper for the multi-task DistilBERT model trained on:
 - salary & benefits
 
 The model expects a local model_output directory with best.pt and tokenizer files.
+Architecture matches train_advanced.py with feature extractor and proper heads.
 """
 
 from pathlib import Path
 from typing import Dict, List
 import logging
+import json
 
 import torch
 from torch import nn
@@ -28,22 +30,96 @@ ASPECT_NAMES = [
     "salary_benefits",
 ]
 
+# Default hyperparameters (will be overridden by config.json if available)
+DEFAULT_HIDDEN_DIM = 384
+DEFAULT_DROPOUT = 0.35
+DEFAULT_RATING_MIN = 1.0
+DEFAULT_RATING_MAX = 5.0
+
 
 class MultiTaskDistilBert(nn.Module):
-    def __init__(self, base_model: str, aspect_names: List[str]):
+    """
+    Multi-task DistilBERT with feature extractor and sequential heads.
+    Matches train_advanced.py architecture.
+    
+    Architecture:
+    - Encoder: DistilBERT
+    - Feature Extractor: 2 Linear layers with LayerNorm + GELU + Dropout
+    - Heads: Sequential with hidden_dim//2 intermediate layer
+    - Output: Scaled sigmoid to [rating_min, rating_max]
+    """
+    
+    def __init__(self, base_model: str, aspect_names: List[str],
+                 hidden_dim: int = DEFAULT_HIDDEN_DIM, 
+                 dropout: float = DEFAULT_DROPOUT,
+                 rating_min: float = DEFAULT_RATING_MIN,
+                 rating_max: float = DEFAULT_RATING_MAX):
         super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.rating_min = rating_min
+        self.rating_max = rating_max
+        
         self.encoder = DistilBertModel.from_pretrained(base_model)
-        hidden_size = self.encoder.config.hidden_size
-        self.dropout = nn.Dropout(0.1)
-        self.overall_head = nn.Linear(hidden_size, 1)
-        self.aspect_heads = nn.ModuleDict({a: nn.Linear(hidden_size, 1) for a in aspect_names})
+        encoder_dim = self.encoder.config.hidden_size  # 768
+
+        # Freeze early transformer layers
+        for i, param in enumerate(self.encoder.parameters()):
+            if i < len(list(self.encoder.parameters())) - 8:
+                param.requires_grad = False
+
+        # Shared feature extractor (matches train_advanced.py)
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(encoder_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        # Overall rating head
+        self.overall_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+        # Aspect heads
+        self.aspect_heads = nn.ModuleDict({
+            a: nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 2, 1)
+            )
+            for a in aspect_names
+        })
+
+    def _scale_output(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Scale raw logit to [rating_min, rating_max] range using sigmoid.
+        sigmoid(x) maps (-inf, +inf) → (0, 1)
+        * (rating_max - rating_min) + rating_min maps (0, 1) → (rating_min, rating_max)
+        """
+        return torch.sigmoid(x) * (self.rating_max - self.rating_min) + self.rating_min
 
     def forward(self, input_ids, attention_mask):
-        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = self.dropout(out.last_hidden_state[:, 0])
-        logits = {"overall": self.overall_head(pooled).squeeze(-1)}
+        encoded = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = encoded.last_hidden_state[:, 0]  # [CLS] token
+
+        features = self.feature_extractor(pooled)
+
+        logits = {
+            "overall": self._scale_output(self.overall_head(features).squeeze(-1))
+        }
         for aspect, head in self.aspect_heads.items():
-            logits[aspect] = head(pooled).squeeze(-1)
+            logits[aspect] = self._scale_output(head(features).squeeze(-1))
+
         return logits
 
 
@@ -60,7 +136,7 @@ class SentimentAnalyzer:
 
     def __init__(
         self,
-        model_dir: str = "model_output",
+        model_dir: str = "model_output_v3",
         base_model: str = "distilbert-base-uncased",
         device: str = None,
         max_len: int = 384,
@@ -82,17 +158,46 @@ class SentimentAnalyzer:
 
         logger.info(f"Loading multitask model from {model_dir} on device: {self.device}")
 
+        # Load config.json to get hyperparameters
+        config_path = Path(model_dir) / "config.json"
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            hidden_dim = config.get('hidden_dim', DEFAULT_HIDDEN_DIM)
+            dropout = config.get('dropout', DEFAULT_DROPOUT)
+            rating_min = config.get('rating_min', DEFAULT_RATING_MIN)
+            rating_max = config.get('rating_max', DEFAULT_RATING_MAX)
+            self.base_model = config.get('base_model', base_model)
+            logger.info(f"Loaded config: hidden_dim={hidden_dim}, dropout={dropout}, rating_range=[{rating_min},{rating_max}]")
+        else:
+            logger.warning(f"config.json not found in {model_dir}, using defaults")
+            hidden_dim = DEFAULT_HIDDEN_DIM
+            dropout = DEFAULT_DROPOUT
+            rating_min = DEFAULT_RATING_MIN
+            rating_max = DEFAULT_RATING_MAX
+
         try:
             self.tokenizer = DistilBertTokenizerFast.from_pretrained(model_dir)
         except Exception:
             logger.warning("Tokenizer files not found in model_output. Falling back to base model tokenizer.")
-            self.tokenizer = DistilBertTokenizerFast.from_pretrained(base_model)
+            self.tokenizer = DistilBertTokenizerFast.from_pretrained(self.base_model)
 
-        self.model = MultiTaskDistilBert(base_model, ASPECT_NAMES)
+        self.model = MultiTaskDistilBert(
+            self.base_model, 
+            ASPECT_NAMES,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            rating_min=rating_min,
+            rating_max=rating_max
+        )
         state = torch.load(state_path, map_location=self.device)
         self.model.load_state_dict(state)
         self.model.to(self.device)
         self.model.eval()
+        
+        # Store rating range for later use
+        self.rating_min = rating_min
+        self.rating_max = rating_max
 
     @staticmethod
     def _clamp_score(score: float) -> float:
@@ -194,6 +299,7 @@ def demo_sentiment_analysis():
         "Interview process was smooth, very professional",
         "Terrible leadership and poor compensation",
         "Great benefits but no work-life balance",
+
     ]
 
     print("=" * 80)
