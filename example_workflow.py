@@ -54,7 +54,9 @@ def main():
         "Great benefits package and health coverage.",
         "Flexible remote policy makes life easier.",
         "Promotion process feels unfair and inconsistent.",
-        "Very Positive Review. Great companyculture, excellent work-life balance, amazing career growth opportunities, and competitive salary."
+        "Very Positive Review. Great companyculture, excellent work-life balance, amazing career growth opportunities, and competitive salary.",
+        "Terrible management, toxic culture, low pay, no growth. Worst company ever.",
+        "Okay job. Nothing special, nothing terrible. Average experience."
     ]
     
     company_id = 12345

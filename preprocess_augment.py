@@ -140,6 +140,20 @@ def augment_text(text: str) -> str:
     return " ".join(augmented_words)
 
 
+def rating_to_sentiment_class(rating: float) -> int:
+    """
+    Map rating to 3-way sentiment class.
+    0=negative, 1=neutral, 2=positive
+    """
+    if pd.isna(rating):
+        return 1
+    if rating <= 2.5:
+        return 0
+    if rating >= 3.5:
+        return 2
+    return 1
+
+
 def create_augmented_samples(df: pd.DataFrame, augmentation_factor: float = 0.25) -> pd.DataFrame:
     print("\n[3/5] Creating augmented samples...")
     augmented_rows = []
@@ -162,13 +176,55 @@ def create_augmented_samples(df: pd.DataFrame, augmentation_factor: float = 0.25
     return df_augmented
 
 
+def create_targeted_neutral_mixed_augmentation(df: pd.DataFrame, target_factor: float = 0.45) -> pd.DataFrame:
+    """
+    Oversample neutral and mixed-sentiment samples.
+
+    mixed-sentiment heuristic:
+    - neutral overall rating, or
+    - large disagreement across aspect ratings.
+    """
+    print("\n[4/6] Creating targeted neutral/mixed augmentation...")
+    work_df = df.copy()
+    work_df["sentiment_class"] = work_df["overall_rating"].apply(rating_to_sentiment_class)
+
+    aspect_cols = ["work_life_balance", "company_culture", "career_growth", "salary_benefits"]
+    available_aspects = [c for c in aspect_cols if c in work_df.columns]
+
+    aspect_std = work_df[available_aspects].std(axis=1, skipna=True) if available_aspects else pd.Series(np.zeros(len(work_df)))
+    neutral_mask = work_df["sentiment_class"] == 1
+    mixed_mask = neutral_mask | (aspect_std >= 0.95)
+    target_pool = work_df[mixed_mask]
+
+    if len(target_pool) == 0:
+        print("  No neutral/mixed samples detected; skipping targeted augmentation")
+        return df
+
+    n_target = int(len(df) * target_factor)
+    sampled = target_pool.sample(n=n_target, replace=True, random_state=SEED).copy()
+
+    for i in range(len(sampled)):
+        sampled.iloc[i, sampled.columns.get_loc("text")] = augment_text(sampled.iloc[i]["text"])
+        for col in ["overall_rating"] + available_aspects:
+            if not pd.isna(sampled.iloc[i][col]):
+                sampled.iloc[i, sampled.columns.get_loc(col)] = round(
+                    max(1.0, min(5.0, sampled.iloc[i][col] + np.random.normal(0, 0.06))),
+                    1,
+                )
+
+    combined = pd.concat([df, sampled.drop(columns=["sentiment_class"])], ignore_index=True)
+    print(f"  Added targeted samples: {len(sampled)}")
+    print(f"  Total samples: {len(df)} → {len(combined)}")
+    return combined
+
+
 def soft_balance_ratings(df: pd.DataFrame, column: str = 'overall_rating') -> pd.DataFrame:
     """
     Soft balancing using continuous bins.
     Does NOT use hard integer bins — that would destroy continuous distributions.
     Only lightly upsamples extremely underrepresented ranges.
     """
-    print("\n[4/5] Soft-balancing rating distribution (continuous-aware)...")
+    print("\n[5/6] Soft-balancing rating distribution (continuous-aware)...")
     if column not in df.columns:
         return df
 
@@ -200,6 +256,32 @@ def soft_balance_ratings(df: pd.DataFrame, column: str = 'overall_rating') -> pd
     df_balanced = df_balanced.drop(columns=['_bin'])
     print(f"  Total after balancing: {len(df_balanced):,}")
     return df_balanced
+
+
+def balance_sentiment_classes(df: pd.DataFrame) -> pd.DataFrame:
+    """Lightly rebalance 3-way sentiment classes derived from rating."""
+    print("\n[6/6] Balancing sentiment classes (negative/neutral/positive)...")
+    work_df = df.copy()
+    work_df["sentiment_class"] = work_df["overall_rating"].apply(rating_to_sentiment_class)
+
+    class_counts = work_df["sentiment_class"].value_counts().to_dict()
+    print(f"  Class distribution before: {class_counts}")
+
+    target = int(np.percentile(list(class_counts.values()), 75))
+    buckets = []
+    for cls in [0, 1, 2]:
+        bucket = work_df[work_df["sentiment_class"] == cls]
+        if len(bucket) == 0:
+            continue
+        if len(bucket) < target:
+            n_add = target - len(bucket)
+            bucket = pd.concat([bucket, bucket.sample(n=n_add, replace=True, random_state=SEED)], ignore_index=True)
+        buckets.append(bucket)
+
+    balanced = pd.concat(buckets, ignore_index=True).sample(frac=1, random_state=SEED).reset_index(drop=True)
+    after_counts = balanced["sentiment_class"].value_counts().to_dict()
+    print(f"  Class distribution after:  {after_counts}")
+    return balanced.drop(columns=["sentiment_class"])
 
 
 def compute_statistics(df: pd.DataFrame) -> None:
@@ -288,11 +370,17 @@ def main():
     # Remove outliers
     df = remove_outliers(df, 'overall_rating', threshold=3.5)
 
-    # Augment
+    # Generic augmentation
     df = create_augmented_samples(df, augmentation_factor=0.25)
 
-    # Soft balance
+    # Target neutral/mixed samples to improve calibration around 3-star region
+    df = create_targeted_neutral_mixed_augmentation(df, target_factor=0.40)
+
+    # Soft balance (continuous bins)
     df = soft_balance_ratings(df, 'overall_rating')
+
+    # Balance sentiment groups derived from rating for multi-task training stability
+    df = balance_sentiment_classes(df)
 
     # Stats
     compute_statistics(df)

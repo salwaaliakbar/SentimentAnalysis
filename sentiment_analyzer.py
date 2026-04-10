@@ -60,6 +60,10 @@ class MultiTaskDistilBert(nn.Module):
         self.dropout = dropout
         self.rating_min = rating_min
         self.rating_max = rating_max
+        self.calibration_rules = config.get(
+            "calibration",
+            {"neutral_range": [2.5, 3.5], "negative_cap": 2.2, "positive_floor": 3.9},
+        )
         
         self.encoder = DistilBertModel.from_pretrained(base_model)
         encoder_dim = self.encoder.config.hidden_size  # 768
@@ -100,6 +104,13 @@ class MultiTaskDistilBert(nn.Module):
             for a in aspect_names
         })
 
+        self.sentiment_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 3)
+        )
+
     def _scale_output(self, x: torch.Tensor) -> torch.Tensor:
         """
         Scale raw logit to [rating_min, rating_max] range using sigmoid.
@@ -115,7 +126,8 @@ class MultiTaskDistilBert(nn.Module):
         features = self.feature_extractor(pooled)
 
         logits = {
-            "overall": self._scale_output(self.overall_head(features).squeeze(-1))
+            "overall": self._scale_output(self.overall_head(features).squeeze(-1)),
+            "sentiment_logits": self.sentiment_head(features)
         }
         for aspect, head in self.aspect_heads.items():
             logits[aspect] = self._scale_output(head(features).squeeze(-1))
@@ -160,6 +172,7 @@ class SentimentAnalyzer:
 
         # Load config.json to get hyperparameters
         config_path = Path(model_dir) / "config.json"
+        config = {}
         if config_path.exists():
             with open(config_path, 'r') as f:
                 config = json.load(f)
@@ -217,8 +230,28 @@ class SentimentAnalyzer:
         return "NEUTRAL"
 
     @staticmethod
+    def _class_to_label(cls_idx: int) -> str:
+        return {0: "NEGATIVE", 1: "NEUTRAL", 2: "POSITIVE"}.get(int(cls_idx), "NEUTRAL")
+
+    @staticmethod
     def _signal_confidence(signal: float) -> float:
         return float(min(1.0, 0.5 + 0.5 * abs(signal)))
+
+    def _apply_calibration(self, raw_rating: float, sentiment_label: str, sentiment_conf: float) -> float:
+        """Rule-based calibration layer to reduce sentiment-rating mismatch."""
+        calibrated = float(raw_rating)
+        neutral_range = self.calibration_rules.get("neutral_range", [2.5, 3.5])
+        negative_cap = float(self.calibration_rules.get("negative_cap", 2.2))
+        positive_floor = float(self.calibration_rules.get("positive_floor", 3.9))
+
+        if sentiment_label == "NEUTRAL" and sentiment_conf >= 0.55:
+            calibrated = min(max(calibrated, neutral_range[0]), neutral_range[1])
+        elif sentiment_label == "NEGATIVE" and sentiment_conf >= 0.60:
+            calibrated = min(calibrated, negative_cap)
+        elif sentiment_label == "POSITIVE" and sentiment_conf >= 0.60:
+            calibrated = max(calibrated, positive_floor)
+
+        return self._clamp_score(calibrated)
 
     def _predict_batch(self, texts: List[str]) -> List[Dict]:
         inputs = self.tokenizer(
@@ -233,21 +266,33 @@ class SentimentAnalyzer:
         with torch.no_grad():
             outputs = self.model(**inputs)
 
+        class_probs = torch.softmax(outputs["sentiment_logits"], dim=-1)
+        class_ids = class_probs.argmax(dim=-1)
+
         results = []
         for idx in range(len(texts)):
-            overall_score = self._clamp_score(outputs["overall"][idx].item())
+            raw_overall_score = self._clamp_score(outputs["overall"][idx].item())
             aspect_scores = {
                 aspect: self._clamp_score(outputs[aspect][idx].item())
                 for aspect in ASPECT_NAMES
             }
+
+            sentiment_class = int(class_ids[idx].item())
+            sentiment_conf = float(class_probs[idx][sentiment_class].item())
+            label = self._class_to_label(sentiment_class)
+
+            overall_score = self._apply_calibration(raw_overall_score, label, sentiment_conf)
+
+            if label == "NEUTRAL":
+                for aspect in aspect_scores:
+                    aspect_scores[aspect] = min(max(aspect_scores[aspect], 2.4), 3.6)
 
             overall_signal = self._score_to_signal(overall_score)
             aspect_signals = {
                 aspect: self._score_to_signal(score)
                 for aspect, score in aspect_scores.items()
             }
-            confidence = self._signal_confidence(overall_signal)
-            label = self._score_to_label(overall_score)
+            confidence = max(self._signal_confidence(overall_signal), sentiment_conf)
 
             results.append(
                 {
@@ -255,7 +300,14 @@ class SentimentAnalyzer:
                     "score": confidence,
                     "confidence": confidence,
                     "overall_rating": overall_score,
+                    "overall_rating_raw": raw_overall_score,
                     "sentiment_signal": overall_signal,
+                    "sentiment_class": sentiment_class,
+                    "sentiment_probs": {
+                        "negative": float(class_probs[idx][0].item()),
+                        "neutral": float(class_probs[idx][1].item()),
+                        "positive": float(class_probs[idx][2].item()),
+                    },
                     "aspect_scores": aspect_scores,
                     "aspect_sentiments": aspect_signals,
                     "text": texts[idx],

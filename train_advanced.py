@@ -1,30 +1,30 @@
 """
-Advanced Training Script - Continuous Rating Prediction
-========================================================
+Production Multi-Task Training Script
+====================================
 
-Key improvements for continuous ratings & higher R²:
-1. Model outputs clamped to [1.0, 5.0] range via sigmoid scaling
-2. Pure MSE + Huber loss (no FocalMSE - it caused median regression)
-3. Removed hard integer balancing from pipeline
-4. Added MAE metric alongside R² for interpretability
-5. Consistent HIDDEN_DIM everywhere (no more architecture mismatch)
-6. Output activation: scaled sigmoid → produces 3.1, 4.2 style predictions
-7. Lower LR + more warmup for stable continuous regression
-8. config.json now saves HIDDEN_DIM so evaluate script can auto-load it
+Upgrades:
+1. Joint learning: rating regression + 3-way sentiment classification
+2. Weighted sampling to mitigate class imbalance
+3. Composite loss: Huber/MSE + CrossEntropy + overconfidence penalty
+4. Neutral-aware diagnostics during validation
+5. Continuous bounded outputs in [1, 5] via scaled sigmoid
 """
 
+import json
 import os
 import random
-from typing import List
+from typing import Dict, List
+
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from transformers import DistilBertTokenizerFast, DistilBertModel, get_cosine_schedule_with_warmup
-import json
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from transformers import DistilBertModel, DistilBertTokenizerFast, get_cosine_schedule_with_warmup
+
 
 # ====== SEED ======
 SEED = 42
@@ -36,75 +36,105 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 # ====== CONFIG ======
 CSV_PATH = "employee_reviews_processed.csv"
 OUT_DIR = "model_output_v3"
 
-# Model — ONE source of truth for HIDDEN_DIM (saved to config.json for eval script)
 BASE_MODEL = "distilbert-base-uncased"
 MAX_LEN = 384
-DROPOUT = 0.35
-HIDDEN_DIM = 384           # ← Single definition. Eval script reads this from config.json
+HIDDEN_DIM = 384
+DROPOUT = 0.30
 
-# Training
-EPOCHS = 60
-BATCH_SIZE = 32
-GRADIENT_ACCUMULATION = 2  # Effective batch = 64
+EPOCHS = 65
+BATCH_SIZE = 24
+GRADIENT_ACCUMULATION = 2
 EFFECTIVE_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION
 
-# Optimization
-LR = 8e-6                  # Lower LR → more stable for continuous regression
+LR = 2e-5
 WEIGHT_DECAY = 0.02
 WARMUP_RATIO = 0.10
 
-# Loss
-ASPECT_LOSS_WEIGHT = 0.4   # Slightly lower — overall_rating is primary target
-USE_HUBER = True           # Huber loss is better than FocalMSE for continuous regression
-HUBER_DELTA = 0.5
-
-# Early stopping
-PATIENCE = 10
-MIN_DELTA = 5e-5
-
-# Rating range (for output clamping)
 RATING_MIN = 1.0
 RATING_MAX = 5.0
 
+ASPECT_LOSS_WEIGHT = 0.35
+CLASSIFICATION_LOSS_WEIGHT = 0.40
+OVERCONF_PENALTY_WEIGHT = 0.05
 
-# ====== LOSS FUNCTIONS ======
+USE_HUBER = True
+HUBER_DELTA = 0.5
+
+PATIENCE = 8
+MIN_DELTA = 1e-4
+
+ASPECT_NAMES = ["work_life_balance", "company_culture", "career_growth", "salary_benefits"]
+
+
+def rating_to_sentiment_class(rating: float) -> int:
+    if pd.isna(rating):
+        return 1
+    if rating <= 2.5:
+        return 0
+    if rating >= 3.5:
+        return 2
+    return 1
+
+
+def sentiment_from_text_rule(text: str) -> int:
+    """
+    Lightweight heuristic used for calibration labels only.
+    0=negative, 1=neutral, 2=positive
+    """
+    if not isinstance(text, str):
+        return 1
+    lower = text.lower()
+
+    neg_terms = ["terrible", "awful", "toxic", "bad", "burnout", "worst", "low pay", "poor"]
+    pos_terms = ["great", "excellent", "amazing", "supportive", "best", "fantastic", "good"]
+
+    neg_hits = sum(term in lower for term in neg_terms)
+    pos_hits = sum(term in lower for term in pos_terms)
+
+    if neg_hits >= pos_hits + 1:
+        return 0
+    if pos_hits >= neg_hits + 1:
+        return 2
+    return 1
+
+
 class HuberLoss(nn.Module):
-    """
-    Huber loss: MSE for small errors, MAE for large errors.
-    Better than FocalMSE for continuous regression — does NOT push
-    predictions toward the mean as aggressively.
-    """
     def __init__(self, delta: float = 0.5):
         super().__init__()
         self.delta = delta
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = torch.abs(pred - target)
-        loss = torch.where(
-            diff < self.delta,
-            0.5 * diff ** 2 / self.delta,
-            diff - 0.5 * self.delta
-        )
+        loss = torch.where(diff < self.delta, 0.5 * diff.pow(2) / self.delta, diff - 0.5 * self.delta)
         return loss.mean()
 
 
-def masked_huber(pred: torch.Tensor, target: torch.Tensor, delta: float = 0.5) -> torch.Tensor:
-    """Huber loss with NaN masking for aspect scores"""
+def masked_regression_loss(pred: torch.Tensor, target: torch.Tensor, use_huber: bool, delta: float) -> torch.Tensor:
     mask = ~torch.isnan(target)
     if mask.sum() == 0:
         return torch.tensor(0.0, device=pred.device)
-    diff = torch.abs(pred[mask] - target[mask])
-    loss = torch.where(diff < delta, 0.5 * diff ** 2 / delta, diff - 0.5 * delta)
-    return loss.mean()
+    if use_huber:
+        diff = torch.abs(pred[mask] - target[mask])
+        return torch.where(diff < delta, 0.5 * diff.pow(2) / delta, diff - 0.5 * delta).mean()
+    return nn.functional.mse_loss(pred[mask], target[mask])
 
 
-# ====== DATASET ======
+def confidence_penalty(class_logits: torch.Tensor) -> torch.Tensor:
+    """Penalize overconfident class distributions with low entropy."""
+    probs = torch.softmax(class_logits, dim=-1)
+    entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
+    max_entropy = float(np.log(3.0))
+    penalty = torch.clamp(0.65 * max_entropy - entropy, min=0.0)
+    return penalty.mean()
+
+
 class ReviewDataset(Dataset):
-    def __init__(self, encodings, labels):
+    def __init__(self, encodings: Dict[str, torch.Tensor], labels: Dict[str, torch.Tensor]):
         self.encodings = encodings
         self.labels = labels
 
@@ -118,31 +148,18 @@ class ReviewDataset(Dataset):
         return item
 
 
-# ====== MODEL ======
 class MultiTaskDistilBert(nn.Module):
-    """
-    Multi-task DistilBERT for continuous rating prediction.
-
-    Key design choices:
-    - Output uses scaled sigmoid: sigmoid(x) * 4 + 1 → range [1, 5]
-      This ensures predictions like 3.1, 4.2, 2.8 (not just integers)
-    - Separate heads per aspect for better specialization
-    - HIDDEN_DIM is passed in and saved to config — no more mismatches
-    """
-
-    def __init__(self, base_model: str, aspect_names: List[str],
-                 hidden_dim: int = 384, dropout: float = 0.35):
+    def __init__(self, base_model: str, aspect_names: List[str], hidden_dim: int = 384, dropout: float = 0.30):
         super().__init__()
-
+        self.aspect_names = aspect_names
         self.encoder = DistilBertModel.from_pretrained(base_model)
-        encoder_dim = self.encoder.config.hidden_size  # 768
 
-        # Freeze early transformer layers
         for i, param in enumerate(self.encoder.parameters()):
             if i < len(list(self.encoder.parameters())) - 8:
                 param.requires_grad = False
 
-        # Shared feature extractor
+        encoder_dim = self.encoder.config.hidden_size
+
         self.feature_extractor = nn.Sequential(
             nn.Linear(encoder_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -151,357 +168,387 @@ class MultiTaskDistilBert(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
 
-        # Overall rating head
         self.overall_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 1),
         )
 
-        # Aspect heads
-        self.aspect_heads = nn.ModuleDict({
-            a: nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim // 2, 1)
-            )
-            for a in aspect_names
-        })
+        self.aspect_heads = nn.ModuleDict(
+            {
+                a: nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim // 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim // 2, 1),
+                )
+                for a in aspect_names
+            }
+        )
 
-    def _scale_output(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Scale raw logit to [1.0, 5.0] range using sigmoid.
-        sigmoid(x) maps (-inf, +inf) → (0, 1)
-        * 4 + 1 maps (0, 1) → (1, 5)
-        This produces continuous predictions like 3.1, 4.2, 2.8
-        """
+        self.sentiment_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 3),
+        )
+
+    @staticmethod
+    def _scale_output(x: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(x) * (RATING_MAX - RATING_MIN) + RATING_MIN
 
     def forward(self, input_ids, attention_mask):
         encoded = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = encoded.last_hidden_state[:, 0]  # [CLS] token
-
+        pooled = encoded.last_hidden_state[:, 0]
         features = self.feature_extractor(pooled)
 
-        logits = {
-            "overall": self._scale_output(self.overall_head(features).squeeze(-1))
+        out = {
+            "overall": self._scale_output(self.overall_head(features).squeeze(-1)),
+            "sentiment_logits": self.sentiment_head(features),
         }
+
         for aspect, head in self.aspect_heads.items():
-            logits[aspect] = self._scale_output(head(features).squeeze(-1))
+            out[aspect] = self._scale_output(head(features).squeeze(-1))
 
-        return logits
-
-
-# ====== HELPERS ======
-def find_column(df: pd.DataFrame, name: str, fallbacks: List[str] = None) -> str:
-    candidates = [name] + (fallbacks or [])
-    lowered = {c.strip().lower(): c for c in df.columns}
-    for key in candidates:
-        if key.strip().lower() in lowered:
-            return lowered[key.strip().lower()]
-    return ""
+        return out
 
 
-# ====== SETUP ======
-os.makedirs(OUT_DIR, exist_ok=True)
-
-print("="*80)
-print("MULTI-TASK DISTILBERT — CONTINUOUS RATING PREDICTION")
-print("="*80)
-print(f"\nConfiguration:")
-print(f"  Dataset:             {CSV_PATH}")
-print(f"  Model:               {BASE_MODEL}")
-print(f"  Epochs:              {EPOCHS}")
-print(f"  Batch Size:          {BATCH_SIZE} (effective: {EFFECTIVE_BATCH_SIZE})")
-print(f"  Learning Rate:       {LR}")
-print(f"  Warmup Ratio:        {WARMUP_RATIO}")
-print(f"  Dropout:             {DROPOUT}")
-print(f"  Hidden Dim:          {HIDDEN_DIM}")
-print(f"  Loss:                {'Huber' if USE_HUBER else 'MSE'} (delta={HUBER_DELTA})")
-print(f"  Aspect Loss Weight:  {ASPECT_LOSS_WEIGHT}")
-print(f"  Output Range:        [{RATING_MIN}, {RATING_MAX}] (continuous via scaled sigmoid)")
-print(f"  Device:              {'CUDA' if torch.cuda.is_available() else 'CPU'}")
-print("="*80)
-
-# Load data
-print("\n[1/4] Loading dataset...")
-if not os.path.exists(CSV_PATH):
-    print(f"  ERROR: {CSV_PATH} not found!")
-    print(f"  Run: python preprocess_augment.py")
-    exit(1)
-
-df = pd.read_csv(CSV_PATH)
-print(f"  Loaded {len(df):,} samples")
-
-if 'text' not in df.columns:
-    print("  ERROR: 'text' column not found")
-    exit(1)
-
-aspect_names = ["work_life_balance", "company_culture", "career_growth", "salary_benefits"]
-
-# Ensure numeric
-for col in ['overall_rating'] + aspect_names:
-    if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-df = df[df["text"].str.len() > 0]
-df = df[~df["overall_rating"].isna()]
-print(f"  After filtering: {len(df):,} samples")
-
-# Show sample ratings to confirm continuity
-sample_ratings = df['overall_rating'].sample(10, random_state=SEED).round(1).tolist()
-print(f"  Sample overall_ratings: {sample_ratings}")
-print(f"  Rating range: [{df['overall_rating'].min():.1f}, {df['overall_rating'].max():.1f}]")
-print(f"  Rating mean: {df['overall_rating'].mean():.3f}, std: {df['overall_rating'].std():.3f}")
-
-# Verify ratings are actually continuous (not all integers)
-is_all_int = all(df['overall_rating'].dropna().apply(lambda x: x == int(x)))
-if is_all_int:
-    print("\n  WARNING: All ratings appear to be integers!")
-    print("  Continuous predictions may be limited. Run preprocess_augment.py first.")
-else:
-    print(f"  ✓ Ratings are continuous (not all integers)")
-
-# Split
-train_df, val_df = train_test_split(df, test_size=0.15, random_state=SEED)
-print(f"  Train: {len(train_df):,} | Val: {len(val_df):,}")
-
-# Tokenize
-print("\n[2/4] Tokenizing...")
-tokenizer = DistilBertTokenizerFast.from_pretrained(BASE_MODEL)
-
-train_enc = tokenizer(
-    train_df["text"].tolist(),
-    truncation=True, padding=True, max_length=MAX_LEN, return_tensors="pt"
-)
-val_enc = tokenizer(
-    val_df["text"].tolist(),
-    truncation=True, padding=True, max_length=MAX_LEN, return_tensors="pt"
-)
-
-def build_labels(frame):
-    labels = {"overall": torch.tensor(frame["overall_rating"].values, dtype=torch.float)}
-    for a in aspect_names:
+def build_labels(frame: pd.DataFrame) -> Dict[str, torch.Tensor]:
+    labels = {
+        "overall": torch.tensor(frame["overall_rating"].values, dtype=torch.float32),
+        "sentiment_class": torch.tensor(frame["sentiment_class"].values, dtype=torch.long),
+    }
+    for a in ASPECT_NAMES:
         if a in frame.columns:
-            labels[a] = torch.tensor(frame[a].values, dtype=torch.float)
+            labels[a] = torch.tensor(frame[a].values, dtype=torch.float32)
+        else:
+            labels[a] = torch.full((len(frame),), float("nan"), dtype=torch.float32)
     return labels
 
-train_dataset = ReviewDataset(train_enc, build_labels(train_df))
-val_dataset = ReviewDataset(val_enc, build_labels(val_df))
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                          pin_memory=True, num_workers=0)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, pin_memory=True, num_workers=0)
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-# Initialize model
-print("\n[3/4] Initializing model...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"  Using device: {device}")
+    print("=" * 80)
+    print("MULTI-TASK DISTILBERT TRAINING (REGRESSION + SENTIMENT CLASSIFICATION)")
+    print("=" * 80)
 
-model = MultiTaskDistilBert(BASE_MODEL, aspect_names, HIDDEN_DIM, DROPOUT).to(device)
+    if not os.path.exists(CSV_PATH):
+        print(f"ERROR: {CSV_PATH} not found. Run preprocess_augment.py first.")
+        return
 
-# Count trainable params
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total = sum(p.numel() for p in model.parameters())
-print(f"  Trainable params: {trainable:,} / {total:,}")
+    df = pd.read_csv(CSV_PATH)
+    if "text" not in df.columns or "overall_rating" not in df.columns:
+        print("ERROR: required columns missing (text, overall_rating)")
+        return
 
-optimizer = AdamW(
-    model.parameters(),
-    lr=LR,
-    weight_decay=WEIGHT_DECAY,
-    betas=(0.9, 0.999),
-    eps=1e-8
-)
+    for col in ["overall_rating"] + ASPECT_NAMES:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-total_steps = (len(train_loader) * EPOCHS) // GRADIENT_ACCUMULATION
-warmup_steps = int(total_steps * WARMUP_RATIO)
-scheduler = get_cosine_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps=warmup_steps,
-    num_training_steps=total_steps
-)
-print(f"  Total steps: {total_steps:,} | Warmup: {warmup_steps:,}")
+    df = df[df["text"].fillna("").str.len() > 20].copy()
+    df = df[~df["overall_rating"].isna()].copy()
 
-loss_fn = HuberLoss(delta=HUBER_DELTA)
+    df["rating_sentiment_class"] = df["overall_rating"].apply(rating_to_sentiment_class)
+    df["text_sentiment_class"] = df["text"].apply(sentiment_from_text_rule)
 
-# Tracking
-best_val_loss = float("inf")
-best_val_r2 = float("-inf")
-patience_ctr = 0
-training_history = {
-    'epoch': [], 'train_loss': [], 'val_loss': [],
-    'val_overall_r2': [], 'val_overall_mae': []
-}
+    disagreement_mask = df["rating_sentiment_class"] != df["text_sentiment_class"]
+    df["sentiment_class"] = np.where(
+        disagreement_mask,
+        1,
+        df["rating_sentiment_class"],
+    )
 
-# Training
-print(f"\n[4/4] Training...")
-print("="*80)
+    print(f"Samples after filtering: {len(df):,}")
+    print(f"Sentiment class distribution: {df['sentiment_class'].value_counts().to_dict()}")
 
-scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
+    train_df, val_df = train_test_split(
+        df,
+        test_size=0.15,
+        random_state=SEED,
+        stratify=df["sentiment_class"],
+    )
 
-for epoch in range(1, EPOCHS + 1):
-    # ====== TRAIN ======
-    model.train()
-    total_loss = 0
-    step_count = 0
-    optimizer.zero_grad()
+    tokenizer = DistilBertTokenizerFast.from_pretrained(BASE_MODEL)
+    train_enc = tokenizer(
+        train_df["text"].tolist(),
+        truncation=True,
+        padding=True,
+        max_length=MAX_LEN,
+        return_tensors="pt",
+    )
+    val_enc = tokenizer(
+        val_df["text"].tolist(),
+        truncation=True,
+        padding=True,
+        max_length=MAX_LEN,
+        return_tensors="pt",
+    )
 
-    for batch_idx, batch in enumerate(train_loader):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = {k: v.to(device) for k, v in batch.items()
-                  if k not in ["input_ids", "attention_mask"]}
+    train_dataset = ReviewDataset(train_enc, build_labels(train_df))
+    val_dataset = ReviewDataset(val_enc, build_labels(val_df))
 
-        if scaler:
-            with torch.cuda.amp.autocast():
-                out = model(input_ids, attention_mask)
-                loss = loss_fn(out["overall"], labels["overall"])
-                for a in aspect_names:
-                    if a in labels:
-                        loss = loss + ASPECT_LOSS_WEIGHT * masked_huber(out[a], labels[a], HUBER_DELTA)
-                loss = loss / GRADIENT_ACCUMULATION
+    class_counts = train_df["sentiment_class"].value_counts().to_dict()
+    class_weights = {
+        k: len(train_df) / (len(class_counts) * v)
+        for k, v in class_counts.items()
+    }
+    sample_weights = train_df["sentiment_class"].map(class_weights).values
+    sampler = WeightedRandomSampler(
+        weights=torch.DoubleTensor(sample_weights),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
 
-            scaler.scale(loss).backward()
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        sampler=sampler,
+        pin_memory=True,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=0,
+    )
 
-            if (batch_idx + 1) % GRADIENT_ACCUMULATION == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad()
-        else:
-            out = model(input_ids, attention_mask)
-            loss = loss_fn(out["overall"], labels["overall"])
-            for a in aspect_names:
-                if a in labels:
-                    loss = loss + ASPECT_LOSS_WEIGHT * masked_huber(out[a], labels[a], HUBER_DELTA)
-            loss = loss / GRADIENT_ACCUMULATION
-            loss.backward()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = MultiTaskDistilBert(BASE_MODEL, ASPECT_NAMES, HIDDEN_DIM, DROPOUT).to(device)
 
-            if (batch_idx + 1) % GRADIENT_ACCUMULATION == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    total_steps = (len(train_loader) * EPOCHS) // GRADIENT_ACCUMULATION
+    warmup_steps = int(total_steps * WARMUP_RATIO)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
 
-        total_loss += loss.item() * GRADIENT_ACCUMULATION
-        step_count += 1
+    reg_loss_fn = HuberLoss(delta=HUBER_DELTA) if USE_HUBER else nn.MSELoss()
+    ce_weights = torch.tensor(
+        [class_weights.get(0, 1.0), class_weights.get(1, 1.0), class_weights.get(2, 1.0)],
+        dtype=torch.float32,
+        device=device,
+    )
+    cls_loss_fn = nn.CrossEntropyLoss(weight=ce_weights, label_smoothing=0.05)
 
-    avg_train_loss = total_loss / step_count
+    scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
 
-    # ====== VALIDATION ======
-    model.eval()
-    val_loss = 0
-    val_count = 0
-    all_preds = []
-    all_labels = []
+    best_val_loss = float("inf")
+    best_val_r2 = float("-inf")
+    patience_ctr = 0
 
-    with torch.no_grad():
-        for batch in val_loader:
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "val_overall_r2": [],
+        "val_overall_mae": [],
+        "val_sentiment_acc": [],
+        "val_neutral_mae": [],
+    }
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        running_loss = 0.0
+        steps = 0
+        optimizer.zero_grad()
+
+        for batch_idx, batch in enumerate(train_loader):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            batch_labels = {k: v.to(device) for k, v in batch.items()
-                            if k not in ["input_ids", "attention_mask"]}
+            labels = {k: v.to(device) for k, v in batch.items() if k not in ["input_ids", "attention_mask"]}
 
-            out = model(input_ids, attention_mask)
-            loss = loss_fn(out["overall"], batch_labels["overall"])
-            for a in aspect_names:
-                if a in batch_labels:
-                    loss = loss + ASPECT_LOSS_WEIGHT * masked_huber(out[a], batch_labels[a], HUBER_DELTA)
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    out = model(input_ids, attention_mask)
+                    reg_loss = reg_loss_fn(out["overall"], labels["overall"])
+                    aspect_loss = torch.tensor(0.0, device=device)
+                    for a in ASPECT_NAMES:
+                        aspect_loss = aspect_loss + masked_regression_loss(out[a], labels[a], USE_HUBER, HUBER_DELTA)
+                    cls_loss = cls_loss_fn(out["sentiment_logits"], labels["sentiment_class"])
+                    conf_penalty = confidence_penalty(out["sentiment_logits"])
 
-            val_loss += loss.item()
-            val_count += 1
+                    loss = (
+                        reg_loss
+                        + ASPECT_LOSS_WEIGHT * (aspect_loss / max(1, len(ASPECT_NAMES)))
+                        + CLASSIFICATION_LOSS_WEIGHT * cls_loss
+                        + OVERCONF_PENALTY_WEIGHT * conf_penalty
+                    )
+                    loss = loss / GRADIENT_ACCUMULATION
 
-            all_preds.append(out["overall"].cpu().numpy())
-            all_labels.append(batch_labels["overall"].cpu().numpy())
+                scaler.scale(loss).backward()
+                if (batch_idx + 1) % GRADIENT_ACCUMULATION == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    optimizer.zero_grad()
+            else:
+                out = model(input_ids, attention_mask)
+                reg_loss = reg_loss_fn(out["overall"], labels["overall"])
+                aspect_loss = torch.tensor(0.0, device=device)
+                for a in ASPECT_NAMES:
+                    aspect_loss = aspect_loss + masked_regression_loss(out[a], labels[a], USE_HUBER, HUBER_DELTA)
+                cls_loss = cls_loss_fn(out["sentiment_logits"], labels["sentiment_class"])
+                conf_penalty = confidence_penalty(out["sentiment_logits"])
 
-    avg_val_loss = val_loss / val_count
+                loss = (
+                    reg_loss
+                    + ASPECT_LOSS_WEIGHT * (aspect_loss / max(1, len(ASPECT_NAMES)))
+                    + CLASSIFICATION_LOSS_WEIGHT * cls_loss
+                    + OVERCONF_PENALTY_WEIGHT * conf_penalty
+                )
+                loss = loss / GRADIENT_ACCUMULATION
 
-    # Metrics
-    try:
-        from sklearn.metrics import r2_score, mean_absolute_error
-        all_preds_np = np.concatenate(all_preds)
-        all_labels_np = np.concatenate(all_labels)
-        val_r2 = r2_score(all_labels_np, all_preds_np)
-        val_mae = mean_absolute_error(all_labels_np, all_preds_np)
+                loss.backward()
+                if (batch_idx + 1) % GRADIENT_ACCUMULATION == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
-        # Show sample predictions every 10 epochs
-        if epoch % 10 == 0 or epoch <= 3:
-            sample_idx = np.random.choice(len(all_preds_np), 5, replace=False)
-            sample_pairs = [(round(float(all_preds_np[i]), 2), round(float(all_labels_np[i]), 1))
-                            for i in sample_idx]
-            print(f"  Sample (pred→true): {sample_pairs}")
-    except Exception:
-        val_r2 = 0.0
-        val_mae = 0.0
+            running_loss += loss.item() * GRADIENT_ACCUMULATION
+            steps += 1
 
-    # Track
-    training_history['epoch'].append(epoch)
-    training_history['train_loss'].append(avg_train_loss)
-    training_history['val_loss'].append(avg_val_loss)
-    training_history['val_overall_r2'].append(val_r2)
-    training_history['val_overall_mae'].append(val_mae)
+        avg_train_loss = running_loss / max(1, steps)
 
-    # Save best
-    improvement = ""
-    if avg_val_loss < best_val_loss - MIN_DELTA:
-        improvement = " ← BEST!"
-        best_val_loss = avg_val_loss
-        best_val_r2 = val_r2
-        patience_ctr = 0
-        torch.save(model.state_dict(), os.path.join(OUT_DIR, "best.pt"))
-    else:
-        patience_ctr += 1
+        model.eval()
+        val_loss = 0.0
+        val_steps = 0
+        preds, trues = [], []
+        pred_cls, true_cls = [], []
 
-    print(f"Epoch {epoch:2d}/{EPOCHS} | Train: {avg_train_loss:.4f} | "
-          f"Val: {avg_val_loss:.4f} | R²: {val_r2:.4f} | MAE: {val_mae:.3f}{improvement}")
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = {k: v.to(device) for k, v in batch.items() if k not in ["input_ids", "attention_mask"]}
 
-    if patience_ctr >= PATIENCE:
-        print(f"\n  Early stopping at epoch {epoch}.")
-        break
+                out = model(input_ids, attention_mask)
+                reg_loss = reg_loss_fn(out["overall"], labels["overall"])
+                aspect_loss = torch.tensor(0.0, device=device)
+                for a in ASPECT_NAMES:
+                    aspect_loss = aspect_loss + masked_regression_loss(out[a], labels[a], USE_HUBER, HUBER_DELTA)
+                cls_loss = cls_loss_fn(out["sentiment_logits"], labels["sentiment_class"])
+                conf_penalty = confidence_penalty(out["sentiment_logits"])
 
-# ====== SAVE ======
-print("\n" + "="*80)
-tokenizer.save_pretrained(OUT_DIR)
+                loss = (
+                    reg_loss
+                    + ASPECT_LOSS_WEIGHT * (aspect_loss / max(1, len(ASPECT_NAMES)))
+                    + CLASSIFICATION_LOSS_WEIGHT * cls_loss
+                    + OVERCONF_PENALTY_WEIGHT * conf_penalty
+                )
 
-# Save config — HIDDEN_DIM is stored here so evaluate script reads it automatically
-config = {
-    'base_model': BASE_MODEL,
-    'hidden_dim': HIDDEN_DIM,        # ← Eval script must read this!
-    'dropout': DROPOUT,
-    'aspect_names': aspect_names,
-    'rating_min': RATING_MIN,
-    'rating_max': RATING_MAX,
-    'epochs_trained': epoch,
-    'best_val_loss': float(best_val_loss),
-    'best_val_r2': float(best_val_r2),
-    'hyperparameters': {
-        'lr': LR,
-        'batch_size': BATCH_SIZE,
-        'effective_batch_size': EFFECTIVE_BATCH_SIZE,
-        'dropout': DROPOUT,
-        'hidden_dim': HIDDEN_DIM,
-        'aspect_loss_weight': ASPECT_LOSS_WEIGHT,
-        'huber_delta': HUBER_DELTA,
+                val_loss += loss.item()
+                val_steps += 1
+
+                preds.append(out["overall"].cpu().numpy())
+                trues.append(labels["overall"].cpu().numpy())
+
+                pred_cls.append(out["sentiment_logits"].argmax(dim=-1).cpu().numpy())
+                true_cls.append(labels["sentiment_class"].cpu().numpy())
+
+        avg_val_loss = val_loss / max(1, val_steps)
+
+        all_preds = np.concatenate(preds)
+        all_trues = np.concatenate(trues)
+        all_pred_cls = np.concatenate(pred_cls)
+        all_true_cls = np.concatenate(true_cls)
+
+        val_r2 = r2_score(all_trues, all_preds)
+        val_mae = mean_absolute_error(all_trues, all_preds)
+        val_sent_acc = float((all_pred_cls == all_true_cls).mean())
+
+        neutral_mask = all_true_cls == 1
+        if neutral_mask.any():
+            neutral_mae = float(np.mean(np.abs(all_preds[neutral_mask] - all_trues[neutral_mask])))
+        else:
+            neutral_mae = float("nan")
+
+        history["epoch"].append(epoch)
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(avg_val_loss)
+        history["val_overall_r2"].append(val_r2)
+        history["val_overall_mae"].append(val_mae)
+        history["val_sentiment_acc"].append(val_sent_acc)
+        history["val_neutral_mae"].append(neutral_mae)
+
+        improved = ""
+        if avg_val_loss < best_val_loss - MIN_DELTA:
+            best_val_loss = avg_val_loss
+            best_val_r2 = val_r2
+            patience_ctr = 0
+            improved = " <- BEST"
+            torch.save(model.state_dict(), os.path.join(OUT_DIR, "best.pt"))
+        else:
+            patience_ctr += 1
+
+        print(
+            f"Epoch {epoch:02d}/{EPOCHS} | train={avg_train_loss:.4f} | val={avg_val_loss:.4f} "
+            f"| R2={val_r2:.4f} | MAE={val_mae:.4f} | SentAcc={val_sent_acc:.3f} "
+            f"| NeutralMAE={neutral_mae:.4f}{improved}"
+        )
+
+        if patience_ctr >= PATIENCE:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    tokenizer.save_pretrained(OUT_DIR)
+
+    calibration_rules = {
+        "neutral_range": [2.5, 3.5],
+        "negative_cap": 2.2,
+        "positive_floor": 3.9,
     }
-}
 
-with open(os.path.join(OUT_DIR, 'config.json'), 'w') as f:
-    json.dump(config, f, indent=2)
+    config = {
+        "base_model": BASE_MODEL,
+        "hidden_dim": HIDDEN_DIM,
+        "dropout": DROPOUT,
+        "max_len": MAX_LEN,
+        "aspect_names": ASPECT_NAMES,
+        "rating_min": RATING_MIN,
+        "rating_max": RATING_MAX,
+        "epochs_trained": int(history["epoch"][-1]) if history["epoch"] else 0,
+        "best_val_loss": float(best_val_loss),
+        "best_val_r2": float(best_val_r2),
+        "loss_config": {
+            "use_huber": USE_HUBER,
+            "huber_delta": HUBER_DELTA,
+            "aspect_loss_weight": ASPECT_LOSS_WEIGHT,
+            "classification_loss_weight": CLASSIFICATION_LOSS_WEIGHT,
+            "overconfidence_penalty_weight": OVERCONF_PENALTY_WEIGHT,
+        },
+        "calibration": calibration_rules,
+        "hyperparameters": {
+            "lr": LR,
+            "batch_size": BATCH_SIZE,
+            "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+            "weight_decay": WEIGHT_DECAY,
+            "warmup_ratio": WARMUP_RATIO,
+            "patience": PATIENCE,
+        },
+    }
 
-pd.DataFrame(training_history).to_csv(os.path.join(OUT_DIR, 'training_history.csv'), index=False)
+    with open(os.path.join(OUT_DIR, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
-print(f"✓ Training complete!")
-print(f"  Best validation loss: {best_val_loss:.4f}")
-print(f"  Best validation R²:   {best_val_r2:.4f}")
-print(f"  Best validation MAE:  {min(training_history['val_overall_mae']):.4f}")
-print(f"  Model saved to: {OUT_DIR}")
-print(f"\n  config.json contains HIDDEN_DIM={HIDDEN_DIM} — your evaluate script")
-print(f"  MUST read this value instead of hardcoding it!")
-print("="*80)
+    pd.DataFrame(history).to_csv(os.path.join(OUT_DIR, "training_history.csv"), index=False)
+
+    print("=" * 80)
+    print(f"Training complete. Best val loss={best_val_loss:.4f}, best R2={best_val_r2:.4f}")
+    print(f"Artifacts saved to {OUT_DIR}")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
