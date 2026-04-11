@@ -85,21 +85,39 @@ class DistilBertMultiHeadRegressor(nn.Module):
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    if len(y_true) > 1:
-        pearson_r = float(pearsonr(y_true, y_pred)[0])
+    # Filter out NaN/inf values to avoid pearsonr crashes
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if valid_mask.sum() == 0:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "r2": float("nan"),
+            "pearson_r": float("nan"),
+            "mean_true": float("nan"),
+            "mean_pred": float("nan"),
+            "bias": float("nan"),
+            "std_true": float("nan"),
+            "std_pred": float("nan"),
+        }
+    
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    
+    if len(y_true_valid) > 1:
+        pearson_r = float(pearsonr(y_true_valid, y_pred_valid)[0])
     else:
         pearson_r = float("nan")
-    errors = np.abs(y_pred - y_true)
+    
     return {
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "r2": float(r2_score(y_true, y_pred)),
+        "mae": float(mean_absolute_error(y_true_valid, y_pred_valid)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true_valid, y_pred_valid))),
+        "r2": float(r2_score(y_true_valid, y_pred_valid)),
         "pearson_r": pearson_r,
-        "mean_true": float(np.mean(y_true)),
-        "mean_pred": float(np.mean(y_pred)),
-        "bias": float(np.mean(y_pred - y_true)),
-        "std_true": float(np.std(y_true)),
-        "std_pred": float(np.std(y_pred)),
+        "mean_true": float(np.mean(y_true_valid)),
+        "mean_pred": float(np.mean(y_pred_valid)),
+        "bias": float(np.mean(y_pred_valid - y_true_valid)),
+        "std_true": float(np.std(y_true_valid)),
+        "std_pred": float(np.std(y_pred_valid)),
     }
 
 
@@ -165,7 +183,7 @@ def main() -> None:
 
     _, val_df = train_test_split(df, test_size=0.15, random_state=SEED, stratify=df["rating_class"])
 
-    tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_DIR)
+    tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_DIR, clean_up_tokenization_spaces=False)
     val_encodings = tokenizer(
         val_df["review_input"].tolist(),
         truncation=True,

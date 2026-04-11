@@ -100,8 +100,8 @@ def rating_class(rating: float) -> int:
     return 1
 
 
-def row_target_class(row: pd.Series) -> int:
-    return rating_class(float(row["overall_rating"]))
+def row_target_class(rating_value: float) -> int:
+    return rating_class(float(rating_value))
 
 
 def build_labels(frame: pd.DataFrame) -> Dict[str, torch.Tensor]:
@@ -164,15 +164,39 @@ def compute_metrics(targets: Dict[str, np.ndarray], predictions: Dict[str, np.nd
     for name in OUTPUT_NAMES:
         y_true = targets[name]
         y_pred = predictions[name]
-        pearson_r = float(pearsonr(y_true, y_pred)[0]) if len(y_true) > 1 else float("nan")
+
+        # Some heads can contain missing labels; evaluate only on finite pairs.
+        valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        y_true_valid = y_true[valid_mask]
+        y_pred_valid = y_pred[valid_mask]
+
+        if len(y_true_valid) == 0:
+            metrics[name] = {
+                "mae": float("nan"),
+                "rmse": float("nan"),
+                "r2": float("nan"),
+                "pearson_r": float("nan"),
+                "mean_true": float("nan"),
+                "mean_pred": float("nan"),
+                "bias": float("nan"),
+            }
+            continue
+
+        pearson_r = float(pearsonr(y_true_valid, y_pred_valid)[0]) if len(y_true_valid) > 1 else float("nan")
+
+        if len(y_true_valid) > 1:
+            r2 = float(r2_score(y_true_valid, y_pred_valid))
+        else:
+            r2 = float("nan")
+
         metrics[name] = {
-            "mae": float(mean_absolute_error(y_true, y_pred)),
-            "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-            "r2": float(r2_score(y_true, y_pred)),
+            "mae": float(mean_absolute_error(y_true_valid, y_pred_valid)),
+            "rmse": float(np.sqrt(mean_squared_error(y_true_valid, y_pred_valid))),
+            "r2": r2,
             "pearson_r": pearson_r,
-            "mean_true": float(np.mean(y_true)),
-            "mean_pred": float(np.mean(y_pred)),
-            "bias": float(np.mean(y_pred - y_true)),
+            "mean_true": float(np.mean(y_true_valid)),
+            "mean_pred": float(np.mean(y_pred_valid)),
+            "bias": float(np.mean(y_pred_valid - y_true_valid)),
         }
     return metrics
 
@@ -248,7 +272,7 @@ def main() -> None:
         stratify=df["target_class"],
     )
 
-    tokenizer = DistilBertTokenizerFast.from_pretrained(BASE_MODEL)
+    tokenizer = DistilBertTokenizerFast.from_pretrained(BASE_MODEL, clean_up_tokenization_spaces=False)
     train_encodings = tokenizer(
         train_df["review_input"].tolist(),
         truncation=True,
