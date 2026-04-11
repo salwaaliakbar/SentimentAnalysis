@@ -11,6 +11,10 @@ Techniques:
 5. Submission pattern analysis
 """
 
+import utils.clients
+import utils.http_session
+import utils.transport
+import utils.session
 import numpy as np
 from typing import Dict, List, Tuple, Set
 from datetime import datetime, timedelta
