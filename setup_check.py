@@ -116,15 +116,15 @@ def download_model():
     """Check local trained model and tokenizer files."""
     print_section("5. Checking Trained Model")
 
-    model_dir = Path("model_output")
+    model_dir = Path("model_output_v3")
     weights_path = model_dir / "best.pt"
 
     if weights_path.exists():
         print(f"✅ Found trained weights: {weights_path}")
         return True
 
-    print("❌ Trained model not found in model_output/")
-    print("   Place the Google Drive model_output folder in the project root.")
+    print("❌ Trained model not found in model_output_v3/")
+    print("   Run training to create the checkpoint in model_output_v3.")
     return False
 
 def test_import():

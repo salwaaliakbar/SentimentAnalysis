@@ -1,95 +1,94 @@
-"""
-Minimal REST API for sentiment inference.
-
-Single endpoint:
-- POST /analyze
-
-Input: list of comments
-Output: sentiment scores per comment
-"""
+"""REST API for five-head employee review rating inference."""
 
 from datetime import datetime
 import logging
 from typing import List
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sentiment_analyzer import SentimentAnalyzer
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Sentiment Analysis API",
-    description="Inference endpoint for trained multitask model",
-    version="1.0.0"
+    title="Employee Review Rating API",
+    description="Predict overall, work-life balance, culture, career opportunities, and salary ratings.",
+    version="2.0.0",
 )
 
 sentiment_analyzer = None
 
 
-class AnalyzeRequest(BaseModel):
-    """Input: list of comments to analyze."""
-
-    comments: List[str]
+class PredictRequest(BaseModel):
+    review: str = Field(..., description="Single employee review text")
 
 
-class AnalyzeItem(BaseModel):
-    """Output: sentiment score per comment."""
-
-    comment: str
-    sentiment_score: float
+class BatchRequest(BaseModel):
+    reviews: List[str] = Field(..., description="Batch of employee review texts")
 
 
-class AnalyzeResponse(BaseModel):
-    """Batch response with sentiment scores."""
+class RatingResponse(BaseModel):
+    review: str
+    overall_rating: float
+    work_life_balance: float
+    company_culture: float
+    career_opportunities: float
+    salary_benefits: float
 
-    results: List[AnalyzeItem]
+
+class BatchResponse(BaseModel):
+    results: List[RatingResponse]
     timestamp: str
 
 
 @app.on_event("startup")
-async def startup_event():
+async def startup_event() -> None:
     global sentiment_analyzer
 
     try:
         logger.info("Loading sentiment analyzer...")
         sentiment_analyzer = SentimentAnalyzer(device="cpu")
-        logger.info("✅ Model loaded")
+        logger.info("Model loaded")
     except Exception as exc:
-        logger.error(f"❌ Startup failed: {exc}")
-        raise
+        logger.exception("Startup failed")
+        raise exc
 
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_comments(request: AnalyzeRequest):
+def to_response(item: dict) -> RatingResponse:
+    return RatingResponse(
+        review=item["text"],
+        overall_rating=float(item["overall_rating"]),
+        work_life_balance=float(item["work_life_balance"]),
+        company_culture=float(item["company_culture"]),
+        career_opportunities=float(item["career_opportunities"]),
+        salary_benefits=float(item["salary_benefits"]),
+    )
+
+
+@app.post("/predict", response_model=RatingResponse)
+async def predict_review(request: PredictRequest):
     if sentiment_analyzer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-
-    if not request.comments:
-        raise HTTPException(status_code=400, detail="comments list is empty")
-
-    results = sentiment_analyzer.batch_predict(request.comments)
-    payload = [
-        AnalyzeItem(comment=item["text"], sentiment_score=item["overall_rating"])
-        for item in results
-    ]
-
-    return AnalyzeResponse(results=payload, timestamp=datetime.now().isoformat())
+    if not request.review.strip():
+        raise HTTPException(status_code=400, detail="review is empty")
+    return to_response(sentiment_analyzer.predict(request.review))
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Run
-# ─────────────────────────────────────────────────────────────────────────
+@app.post("/analyze", response_model=BatchResponse)
+async def analyze_reviews(request: BatchRequest):
+    if sentiment_analyzer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if not request.reviews:
+        raise HTTPException(status_code=400, detail="reviews list is empty")
+
+    results = [to_response(item) for item in sentiment_analyzer.batch_predict(request.reviews)]
+    return BatchResponse(results=results, timestamp=datetime.now().isoformat())
+
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # Start server
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info"
-    )
+
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
